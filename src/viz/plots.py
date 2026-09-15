@@ -1,0 +1,287 @@
+# -*- coding: utf-8 -*-
+"""Görselleştirme: maske overlay, baseline-vs-semantic yan yana, RD eğrileri.
+
+Renkler CVD-güvenli Okabe-Ito paletinden sabit sırayla atanır; seriler ayrıca
+marker şekliyle de ayrışır (renk körlüğü için ikincil kodlama).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Fixed categorical palette + marker map (order is never cycled)
+PALETTE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7"]
+MARKERS = ["o", "s", "^", "D"]
+
+
+def rd_line_figure(dct_points, dwt_points, target_bpp=None):
+    """Rate–Distortion line chart for the Compare tab (mirrors the old
+    RateDistortionChart.tsx): two clean PSNR-vs-bpp curves, small dot markers,
+    a faint dotted target line — no highlight stars.
+
+    dct_points / dwt_points: iterables of (bpp, psnr) or dicts with 'bpp'/'psnr'.
+    """
+    from src.viz.style import (ACCENT_CYAN, ACCENT_PURPLE, BG_PANEL, BORDER,
+                               TEXT_PRIMARY, TEXT_SECONDARY, apply_lab_style)
+
+    def _xy(points):
+        xs, ys = [], []
+        for p in points:
+            b = p["bpp"] if isinstance(p, dict) else p[0]
+            q = p["psnr"] if isinstance(p, dict) else p[1]
+            if b is None or q is None or not np.isfinite(q):
+                continue
+            xs.append(float(b))
+            ys.append(float(q))
+        order = np.argsort(xs)
+        return list(np.asarray(xs)[order]), list(np.asarray(ys)[order])
+
+    plt.close("all")  # Gradio keeps every returned Figure alive; drop the leaked ones
+    fig, ax = plt.subplots(figsize=(9.2, 3.2))
+    dx, dy = _xy(dct_points)
+    wx, wy = _xy(dwt_points)
+    if dx:
+        ax.plot(dx, dy, color=ACCENT_CYAN, marker="o", markersize=4,
+                linewidth=1.8, label="JPEG / DCT")
+    if wx:
+        ax.plot(wx, wy, color=ACCENT_PURPLE, marker="o", markersize=4,
+                linewidth=1.8, label="Wavelet / DWT")
+    if target_bpp is not None:
+        tb = float(target_bpp)
+        ax.axvline(tb, color=TEXT_SECONDARY, linestyle=":", linewidth=1.0, alpha=0.7)
+        ax.annotate(f"target {tb:.2f} bpp",
+                    xy=(tb, ax.get_ylim()[1]), xytext=(4, -12),
+                    textcoords="offset points", fontsize=8, color=TEXT_SECONDARY)
+        # working-point stars: where each curve sits at the current target bpp
+        for cx, cy, col in ((dx, dy, ACCENT_CYAN), (wx, wy, ACCENT_PURPLE)):
+            if len(cx) >= 2:
+                ax.scatter([tb], [float(np.interp(tb, cx, cy))], color=col,
+                           marker="*", s=170, edgecolor=BG_PANEL, linewidth=0.8,
+                           zorder=6)
+    ax.set_xlabel("Bitrate (bpp)")
+    ax.set_ylabel("PSNR (dB)")
+    apply_lab_style(fig, ax)
+    leg = ax.legend(frameon=False, fontsize=9, loc="lower right", labelcolor=TEXT_PRIMARY)
+    if leg is not None:
+        leg.get_frame().set_facecolor(BG_PANEL)
+    fig.tight_layout()
+    return fig
+
+plt.rcParams.update(
+    {
+        "figure.dpi": 120,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linewidth": 0.6,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "font.size": 9,
+    }
+)
+
+
+def overlay_mask(image: np.ndarray, mask: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    """Önem maskesini görüntü üzerine yarı saydam renkle bindirir."""
+    out = image.astype(np.float64).copy()
+    color = np.array([0, 114, 178], dtype=np.float64)  # palet mavisi
+    m = mask.astype(bool)
+    out[m] = (1 - alpha) * out[m] + alpha * color
+    return out.astype(np.uint8)
+
+
+def draw_rect_overlay(image: np.ndarray, x0: int, y0: int, x1: int, y1: int,
+                      color: tuple[int, int, int] = (5, 150, 105)) -> np.ndarray:
+    """Draws the manual ROI rectangle in real pixel coordinates (green,
+    semantic-ROI identity) — same coordinates as
+    src.roi.bit_allocation.rectangle_mask; the real compression region, not
+    decoration."""
+    import cv2
+
+    out = image.copy()
+    if out.ndim == 2:
+        out = np.stack([out] * 3, axis=-1)
+    h, w = out.shape[:2]
+    x0, x1 = sorted((max(0, min(x0, w - 1)), max(0, min(x1, w - 1))))
+    y0, y1 = sorted((max(0, min(y0, h - 1)), max(0, min(y1, h - 1))))
+    cv2.rectangle(out, (x0, y0), (x1, y1), color, 3)
+    return out
+
+
+def plot_mask_overlay(
+    image: np.ndarray, mask: np.ndarray, labels: list[str], out_path: Path
+) -> None:
+    """Orijinal | maske | overlay üçlüsünü kaydeder."""
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.2))
+    axes[0].imshow(image)
+    axes[0].set_title("Original")
+    axes[1].imshow(mask, cmap="gray")
+    axes[1].set_title("YOLO-seg importance mask")
+    axes[2].imshow(overlay_mask(image, mask))
+    axes[2].set_title(f"Overlay ({', '.join(sorted(set(labels))) or 'no objects'})")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _mask_bbox(mask: np.ndarray, pad: int = 12) -> tuple[int, int, int, int]:
+    """Maskenin sınırlayıcı kutusu (y0, y1, x0, x1), kenar payıyla."""
+    ys, xs = np.nonzero(mask)
+    h, w = mask.shape
+    return (
+        max(int(ys.min()) - pad, 0),
+        min(int(ys.max()) + pad, h),
+        max(int(xs.min()) - pad, 0),
+        min(int(xs.max()) + pad, w),
+    )
+
+
+def plot_comparison(
+    original: np.ndarray,
+    baseline: np.ndarray,
+    semantic: np.ndarray,
+    mask: np.ndarray,
+    bpp: float,
+    metrics_base: dict[str, float],
+    metrics_sem: dict[str, float],
+    out_path: Path,
+    engine_name: str,
+) -> None:
+    """Aynı bpp'de baseline vs semantic: tam kare + foreground yakınlaştırma."""
+    y0, y1, x0, x1 = _mask_bbox(mask)
+    panels = [
+        ("Original", original, None),
+        (f"Baseline (uniform) — {bpp:.2f} bpp", baseline, metrics_base),
+        (f"Semantic (ROI) — {bpp:.2f} bpp", semantic, metrics_sem),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8.5))
+    for col, (title, img, m) in enumerate(panels):
+        axes[0, col].imshow(img)
+        sub = title
+        if m is not None:
+            sub += f"\nFG PSNR {m['fg_psnr']:.2f} dB · BG PSNR {m['bg_psnr']:.2f} dB"
+        axes[0, col].set_title(sub, fontsize=9)
+        axes[1, col].imshow(img[y0:y1, x0:x1])
+        axes[1, col].set_title("foreground zoom", fontsize=8)
+        for row in range(2):
+            axes[row, col].axis("off")
+    fig.suptitle(
+        f"{engine_name}: uniform vs semantic bit steering at the same bit budget",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_semantic_rd(
+    base_fg: list[tuple[float, float]],
+    sem_fg: list[tuple[float, float]],
+    base_bg: list[tuple[float, float]],
+    sem_bg: list[tuple[float, float]],
+    out_path: Path,
+    title: str,
+) -> None:
+    """Semantik RD eğrisi: FG/BG PSNR vs bpp, baseline ve semantic birlikte.
+
+    Renk = yöntem (baseline mavi, semantic turuncu); çizgi stili = bölge
+    (düz = foreground, kesikli = background).
+    """
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    series = [
+        ("Baseline FG", base_fg, PALETTE[0], "-", "o"),
+        ("Semantic FG", sem_fg, PALETTE[1], "-", "s"),
+        ("Baseline BG", base_bg, PALETTE[0], "--", "o"),
+        ("Semantic BG", sem_bg, PALETTE[1], "--", "s"),
+    ]
+    for label, pts, color, ls, mk in series:
+        pts = sorted(pts)
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color,
+                linestyle=ls, marker=mk, markersize=5, linewidth=1.8,
+                label=label, alpha=1.0 if ls == "-" else 0.65)
+    ax.set_xlabel("bpp (bits / pixel)")
+    ax.set_ylabel("PSNR (dB)")
+    ax.set_title(title, fontsize=10)
+    ax.legend(frameon=False, ncols=2)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def rd_curve_figure(
+    curves: dict[str, list[tuple[float, float]]],
+    title: str,
+    ylabel: str = "PSNR (dB)",
+    highlight: dict[str, tuple[float, float]] | None = None,
+    target_bpp: float | None = None,
+) -> plt.Figure:
+    """plot_rd_curves ile aynı görsel dil, ama dosyaya yazmak yerine
+    interaktif UI (gr.Plot) için bir Figure döner; isteğe bağlı olarak
+    güncel çalışma noktasını (hedef bpp'de gerçekleşen bpp/PSNR) yıldızla
+    işaretler — slider ile teori arasındaki bağı doğrudan gösterir.
+
+    Laboratuvar karanlık temasıyla stillenir (bkz. src/viz/style.py) —
+    yalnız BU fonksiyon; dosyaya yazılan deney raporları (plot_rd_curves)
+    kendi (açık) temasını korur."""
+    from src.viz.style import (ACCENT_CYAN, ACCENT_PURPLE, METHOD_JPEG2000,
+                               TEXT_PLOT, apply_lab_style, style_legend)
+
+    method_colors = [ACCENT_CYAN, ACCENT_PURPLE, METHOD_JPEG2000, "#F59E0B"]
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    for slot, (label, points) in enumerate(curves.items()):
+        pts = sorted(points)
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        color = method_colors[slot % len(method_colors)]
+        marker = MARKERS[slot % len(MARKERS)]
+        ax.plot(xs, ys, color=color, marker=marker, markersize=5,
+                linewidth=1.8, label=label)
+        if highlight and label in highlight:
+            hx, hy = highlight[label]
+            ax.scatter([hx], [hy], color=color, marker="*", s=260,
+                       edgecolor=TEXT_PLOT, linewidth=1.0, zorder=5)
+    if target_bpp is not None:
+        ax.axvline(target_bpp, color=TEXT_PLOT, linestyle=":", linewidth=1.0, alpha=0.6)
+        ax.annotate(f"TARGET\n{target_bpp:.2f} bpp", xy=(target_bpp, ax.get_ylim()[0]),
+                   xytext=(4, 6), textcoords="offset points", fontsize=7, color=TEXT_PLOT)
+    ax.set_xlabel("bpp (bits / pixel)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=10)
+    apply_lab_style(fig, ax)
+    style_legend(ax)
+    fig.tight_layout()
+    return fig
+
+
+def plot_rd_curves(
+    curves: dict[str, list[tuple[float, float]]],
+    out_path: Path,
+    title: str,
+    ylabel: str = "PSNR (dB)",
+) -> None:
+    """RD eğrileri: {seri adı: [(bpp, kalite), ...]}. Sıra sabit palete eşlenir."""
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    slot = 0  # palet asla döngüye sokulmaz; DCT referansı palet dışıdır
+    for label, points in curves.items():
+        pts = sorted(points)
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        if label.startswith("DCT"):
+            # Referans seri: kesikli koyu gri (wavelet ailesinden ayrışsın)
+            ax.plot(xs, ys, color="#454247", linestyle="--", marker="x",
+                    markersize=6, linewidth=1.6, label=label)
+        else:
+            ax.plot(xs, ys, color=PALETTE[slot], marker=MARKERS[slot],
+                    markersize=5, linewidth=1.8, label=label)
+            slot += 1
+    ax.set_xlabel("bpp (bit / piksel)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=10)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
